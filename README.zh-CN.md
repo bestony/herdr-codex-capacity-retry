@@ -4,12 +4,12 @@
 
 [English](./README.md)
 
-Codex 有时会在任务中途停下，并在终端里留下这样的提示：
+当 Tibo 每次 reset 之后，Codex 就会偶发在任务中途停下，并在终端里留下这样的提示：
 
 ```
 Selected model is at capacity. Please try a different model.
 ```
-
+或者是 
 ```
 stream disconnected before completion: Our servers are currently overloaded.
 Please try again later.
