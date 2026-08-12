@@ -89,6 +89,9 @@ herdr-codex-capacity-retry --min-wait 20 --max-wait 90
 # 调整自适应轮询节奏（卡住 / 正常 / 完全没有 codex agent）
 herdr-codex-capacity-retry --busy-interval 5 --interval 10 --idle-interval 60
 
+# 限制单次扫描内并行处理的目标数（读 pane / 发 continue）
+herdr-codex-capacity-retry --workers 8
+
 # 打印跳过/等待的判断过程，排查为什么没动作
 herdr-codex-capacity-retry --verbose
 ```
@@ -113,6 +116,7 @@ herdr-codex-capacity-retry --verbose
 | `--interval N` | `10` | **active** 档轮询间隔：有 codex agent 存活且没有卡住。 |
 | `--busy-interval N` | `5` | **busy** 档轮询间隔：至少有一个目标正处于容量 episode 中。 |
 | `--idle-interval N` | `60` | **idle** 档轮询间隔：当前完全没有 codex agent。 |
+| `--workers N` | `8` | 单次扫描内最多并行处理的目标数（读 pane 与发 `continue` 一起扇出）。 |
 
 三个间隔都以秒为单位，最小为 1，`--once` 模式下无效。详见[自适应轮询节奏](#自适应轮询节奏)。
 
@@ -138,6 +142,7 @@ herdr-codex-capacity-retry --verbose
 | `HERDR_CAPACITY_INTERVAL` | `--interval` | `10` |
 | `HERDR_CAPACITY_BUSY_INTERVAL` | `--busy-interval` | `5` |
 | `HERDR_CAPACITY_IDLE_INTERVAL` | `--idle-interval` | `60` |
+| `HERDR_CAPACITY_WORKERS` | `--workers` | `8` |
 | `HERDR_CAPACITY_VERBOSE` | `--verbose` | 未设置 —— 只要不是空字符串或 `0` 就启用 |
 | `HERDR_CAPACITY_STATE_DIR` | — | `~/.local/state/herdr-codex-capacity-retry` |
 
@@ -155,7 +160,10 @@ rate limit'
 
 ## 工作原理
 
-每次扫描，对每个目标执行：
+每次扫描会并行处理所有目标（上限为 `--workers`）。因此同一轮轮询里若有多个 agent 到了该发
+`continue` 的时机，会一起提交，而不是一个接一个串行等待。
+
+对每个目标：
 
 1. `herdr agent get <target>` —— 跳过非 Codex 的 agent，以及 `agent_status` 不处于 **settled** 的
    agent。settled 指 `idle`、`done`、`blocked`、`unknown`；正在工作的 agent 永远不会被打断。

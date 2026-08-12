@@ -33,9 +33,12 @@ Usage:
   herdr-codex-capacity-retry --match "rate limit" --match "at capacity"
   herdr-codex-capacity-retry --min-wait 20 --max-wait 60
   herdr-codex-capacity-retry --busy-interval 5 --interval 10 --idle-interval 60
+  herdr-codex-capacity-retry --workers 8     # parallel scans / continues
   herdr-codex-capacity-retry --verbose       # log skip/wait decisions too
 
 HERDR_CAPACITY_MATCH overrides the patterns too; one pattern per line.
+Within one scan, targets (including continue prompts) run in parallel
+up to --workers (HERDR_CAPACITY_WORKERS).
 """
 
 from __future__ import annotations
@@ -46,7 +49,9 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
@@ -87,8 +92,14 @@ DEFAULT_INTERVAL = 10
 DEFAULT_IDLE_INTERVAL = 60
 DEFAULT_MIN_WAIT = 15
 DEFAULT_MAX_WAIT = 60
+# Cap on concurrent target work (agent get / pane read / continue).
+# I/O-bound herdr CLI calls; keep a modest default so a large agent list
+# does not spawn unbounded subprocesses.
+DEFAULT_WORKERS = 8
 
 VERBOSE = False
+# Guards STATE_CACHE load/store when scan_once fans out across threads.
+STATE_LOCK = threading.Lock()
 
 
 class Outcome(Enum):
@@ -225,13 +236,15 @@ STATE_CACHE: dict[str, TargetState] = {}
 
 
 def load_state(target: str, path: Path) -> TargetState:
-    if target not in STATE_CACHE:
-        STATE_CACHE[target] = TargetState.load(path)
-    return STATE_CACHE[target]
+    with STATE_LOCK:
+        if target not in STATE_CACHE:
+            STATE_CACHE[target] = TargetState.load(path)
+        return STATE_CACHE[target]
 
 
 def store_state(target: str, path: Path, state: TargetState) -> None:
-    STATE_CACHE[target] = state
+    with STATE_LOCK:
+        STATE_CACHE[target] = state
     try:
         state.save(path)
     except OSError as exc:
@@ -431,25 +444,74 @@ class ScanResult:
         return "no codex agents"
 
 
+def _process_target_safe(
+    target: str,
+    *,
+    matches: list[str],
+    prompt: str,
+    min_wait: int,
+    max_wait: int,
+    dry_run: bool,
+    state_dir: Path,
+) -> Outcome:
+    """process_target wrapper that never raises into the thread pool."""
+    try:
+        return process_target(
+            target,
+            matches=matches,
+            prompt=prompt,
+            min_wait=min_wait,
+            max_wait=max_wait,
+            dry_run=dry_run,
+            state_dir=state_dir,
+        )
+    except Exception as exc:  # keep watcher alive
+        log(f"error processing {target}: {exc}")
+        # A target that blew up mid-scan may well be mid-episode; the
+        # fast cadence is the safe assumption.
+        return Outcome.STUCK
+
+
 def scan_once(args: argparse.Namespace, state_dir: Path) -> ScanResult:
+    """Scan every target; run them in parallel so multi-agent continues fan out.
+
+    Each target is independent (own pane, own state file). When several agents
+    are due for a continue in the same scan, ThreadPoolExecutor submits all
+    of them at once instead of waiting for each prompt to finish in series.
+    """
     result = ScanResult()
     targets = list(args.targets) if args.targets else list_codex_targets()
-    for target in targets:
-        try:
-            outcome = process_target(
-                target,
-                matches=args.match,
-                prompt=args.prompt,
-                min_wait=args.min_wait,
-                max_wait=args.max_wait,
-                dry_run=args.dry_run,
-                state_dir=state_dir,
-            )
-        except Exception as exc:  # keep watcher alive
-            log(f"error processing {target}: {exc}")
-            # A target that blew up mid-scan may well be mid-episode; the
-            # fast cadence is the safe assumption.
-            outcome = Outcome.STUCK
+    if not targets:
+        return result
+
+    workers = max(1, min(int(args.workers), len(targets)))
+    kwargs = dict(
+        matches=args.match,
+        prompt=args.prompt,
+        min_wait=args.min_wait,
+        max_wait=args.max_wait,
+        dry_run=args.dry_run,
+        state_dir=state_dir,
+    )
+
+    if workers == 1 or len(targets) == 1:
+        outcomes = [
+            _process_target_safe(target, **kwargs) for target in targets
+        ]
+    else:
+        debug(
+            f"scanning {len(targets)} target(s) with {workers} worker(s)"
+        )
+        outcomes = []
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            futures = {
+                pool.submit(_process_target_safe, target, **kwargs): target
+                for target in targets
+            }
+            for fut in as_completed(futures):
+                outcomes.append(fut.result())
+
+    for outcome in outcomes:
         if outcome is Outcome.STUCK:
             result.stuck += 1
         elif outcome is Outcome.PRESENT:
@@ -550,7 +612,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             f"(default: {DEFAULT_IDLE_INTERVAL})"
         ),
     )
+    p.add_argument(
+        "--workers",
+        type=int,
+        default=env_int("HERDR_CAPACITY_WORKERS", DEFAULT_WORKERS),
+        help=(
+            "Max parallel target scans / continues per poll "
+            f"(default: {DEFAULT_WORKERS}; also HERDR_CAPACITY_WORKERS)"
+        ),
+    )
     args = p.parse_args(argv)
+    if args.workers < 1:
+        p.error("--workers must be >= 1")
     if args.match is None:
         # CLI wins over env, env over the built-ins; blank env = no pattern,
         # which main() rejects rather than silently matching everything.
@@ -592,7 +665,7 @@ def main(argv: list[str] | None = None) -> int:
         f"interval busy={intervals[TIER_BUSY]}s "
         f"active={intervals[TIER_ACTIVE]}s idle={intervals[TIER_IDLE]}s "
         f"min_wait={args.min_wait}s max_wait={args.max_wait}s "
-        f"dry_run={args.dry_run})"
+        f"workers={args.workers} dry_run={args.dry_run})"
     )
 
     if args.once:

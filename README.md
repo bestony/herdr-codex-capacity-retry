@@ -91,6 +91,9 @@ herdr-codex-capacity-retry --min-wait 20 --max-wait 90
 # Tune the adaptive poll cadence (stuck / healthy / no codex agent at all)
 herdr-codex-capacity-retry --busy-interval 5 --interval 10 --idle-interval 60
 
+# Cap how many targets are scanned / continued in parallel per poll
+herdr-codex-capacity-retry --workers 8
+
 # Log skip/wait decisions too, to see why nothing is happening
 herdr-codex-capacity-retry --verbose
 ```
@@ -115,6 +118,7 @@ herdr-codex-capacity-retry --verbose
 | `--interval N` | `10` | **active** poll interval: codex agents are alive and none is stuck. |
 | `--busy-interval N` | `5` | **busy** poll interval: at least one target is inside a capacity episode. |
 | `--idle-interval N` | `60` | **idle** poll interval: no codex agent exists at all. |
+| `--workers N` | `8` | Max number of targets processed in parallel in one scan (pane reads and `continue` prompts fan out together). |
 
 All three intervals are in seconds, have a floor of 1, and are ignored with `--once`. See
 [Adaptive poll cadence](#adaptive-poll-cadence).
@@ -142,6 +146,7 @@ Every setting has an env fallback. Precedence is **CLI flag > env var > built-in
 | `HERDR_CAPACITY_INTERVAL` | `--interval` | `10` |
 | `HERDR_CAPACITY_BUSY_INTERVAL` | `--busy-interval` | `5` |
 | `HERDR_CAPACITY_IDLE_INTERVAL` | `--idle-interval` | `60` |
+| `HERDR_CAPACITY_WORKERS` | `--workers` | `8` |
 | `HERDR_CAPACITY_VERBOSE` | `--verbose` | unset — any value other than empty or `0` enables it |
 | `HERDR_CAPACITY_STATE_DIR` | — | `~/.local/state/herdr-codex-capacity-retry` |
 
@@ -161,7 +166,10 @@ the script exits with code `2`.
 
 ## How it works
 
-Each scan, per target:
+Each scan runs every target in parallel (up to `--workers`), so when several agents are due
+for a `continue` in the same poll they are prompted together instead of one after another.
+
+Per target:
 
 1. `herdr agent get <target>` — skip anything that is not a Codex agent, and skip agents
    whose `agent_status` is not **settled**. Settled means `idle`, `done`, `blocked`, or
