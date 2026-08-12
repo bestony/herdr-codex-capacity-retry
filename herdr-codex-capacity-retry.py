@@ -20,6 +20,10 @@ which tolerates single-poll flicker between snapshot sources.
 Matching collapses whitespace on both sides, so a banner that the pane
 word-wraps across lines still matches a single-line pattern.
 
+The poll interval is adaptive: each scan reports what it saw and the next
+sleep is picked from that (see TIER_* below), so the watcher is cheap when
+no codex agent exists and responsive while one is stuck.
+
 Usage:
   herdr-codex-capacity-retry                 # watch all codex agents forever
   herdr-codex-capacity-retry --once          # single scan
@@ -27,7 +31,8 @@ Usage:
   herdr-codex-capacity-retry --dry-run
   herdr-codex-capacity-retry --prompt continue
   herdr-codex-capacity-retry --match "rate limit" --match "at capacity"
-  herdr-codex-capacity-retry --min-wait 20 --max-wait 180 --interval 8
+  herdr-codex-capacity-retry --min-wait 20 --max-wait 60
+  herdr-codex-capacity-retry --busy-interval 5 --interval 10 --idle-interval 60
   herdr-codex-capacity-retry --verbose       # log skip/wait decisions too
 
 HERDR_CAPACITY_MATCH overrides the patterns too; one pattern per line.
@@ -43,6 +48,7 @@ import subprocess
 import sys
 import time
 from dataclasses import dataclass
+from enum import Enum
 from pathlib import Path
 from typing import Any
 
@@ -63,7 +69,38 @@ MISS_RESET = 3
 # treat the next sighting as a fresh episode so it gets the initial wait.
 STALE_AFTER_FLOOR = 600
 
+# Poll cadence tiers, picked per scan from what that scan observed:
+#   busy   at least one target is inside a capacity episode. Polling fast
+#          shortens the gap between "banner cleared / retry due" and the
+#          watcher noticing it.
+#   active codex agents exist and none is stuck. Cheap enough to keep a
+#          new banner from sitting unseen for long.
+#   idle   no codex agent is alive at all. A scan can then only ever cost
+#          one `herdr agent list` that says "nothing to do", so it is
+#          wasteful to repeat it every few seconds.
+TIER_BUSY = "busy"
+TIER_ACTIVE = "active"
+TIER_IDLE = "idle"
+
+DEFAULT_BUSY_INTERVAL = 5
+DEFAULT_INTERVAL = 10
+DEFAULT_IDLE_INTERVAL = 60
+DEFAULT_MIN_WAIT = 15
+DEFAULT_MAX_WAIT = 60
+
 VERBOSE = False
+
+
+class Outcome(Enum):
+    """What a single target looked like during one scan."""
+
+    # Target is gone, or is not (or no longer) a codex agent.
+    ABSENT = "absent"
+    # Codex agent alive, no capacity episode in progress.
+    PRESENT = "present"
+    # Capacity episode in progress: banner up, or waiting out the debounce
+    # / the backoff before the next continue.
+    STUCK = "stuck"
 
 
 def log(msg: str) -> None:
@@ -273,26 +310,31 @@ def process_target(
     max_wait: int,
     dry_run: bool,
     state_dir: Path,
-) -> None:
+) -> Outcome:
     agent = get_agent(target)
     if not agent:
-        return
+        return Outcome.ABSENT
     if agent.get("agent") != "codex":
-        return
+        return Outcome.ABSENT
+
+    state_path = state_dir / f"{safe_key(target)}.json"
+    state = load_state(target, state_path)
 
     status = str(agent.get("agent_status") or "")
     pane = str(agent.get("pane_id") or "?")
     if status not in SETTLED:
+        # The agent is moving, so whatever banner was up is being worked
+        # through; no episode decision can be made from an unsettled pane.
         debug(f"{target}: status={status}, not settled; skip")
-        return
+        return Outcome.PRESENT
 
     out = read_tail(target)
     if out is None:
+        # No observation: keep the current cadence rather than letting a
+        # transient read failure look like a cleared banner.
         debug(f"{target}: pane unreadable; no observation this scan")
-        return
+        return Outcome.STUCK if state.active else Outcome.PRESENT
 
-    state_path = state_dir / f"{safe_key(target)}.json"
-    state = load_state(target, state_path)
     now = time.time()
 
     stale_after = max(4 * max_wait, STALE_AFTER_FLOOR)
@@ -307,7 +349,7 @@ def process_target(
     hit = find_match(out, matches)
     if hit is None:
         if not state.active:
-            return
+            return Outcome.PRESENT
         state.miss_count += 1
         if state.miss_count >= MISS_RESET:
             log(
@@ -315,13 +357,15 @@ def process_target(
                 f"after {state.hit_count} continue(s)"
             )
             store_state(target, state_path, TargetState())
-        else:
-            debug(
-                f"{target}: banner not seen "
-                f"({state.miss_count}/{MISS_RESET} before reset)"
-            )
-            store_state(target, state_path, state)
-        return
+            return Outcome.PRESENT
+        debug(
+            f"{target}: banner not seen "
+            f"({state.miss_count}/{MISS_RESET} before reset)"
+        )
+        store_state(target, state_path, state)
+        # Still inside the debounce window; stay on the fast cadence so the
+        # remaining confirmations land quickly.
+        return Outcome.STUCK
 
     state.last_match_at = now
     state.miss_count = 0
@@ -337,7 +381,7 @@ def process_target(
             f"capacity hit on {target} (pane={pane} status={status} "
             f"match={hit!r}); wait {wait}s then continue"
         )
-        return
+        return Outcome.STUCK
 
     if now < state.next_retry_at:
         store_state(target, state_path, state)
@@ -345,7 +389,7 @@ def process_target(
             f"{target}: banner still up, "
             f"{int(state.next_retry_at - now)}s until next continue"
         )
-        return
+        return Outcome.STUCK
 
     if send_continue(target, prompt, dry_run):
         state.hit_count += 1
@@ -360,16 +404,39 @@ def process_target(
         wait = backoff_seconds(state.hit_count, min_wait, max_wait)
         state.next_retry_at = now + wait
         store_state(target, state_path, state)
+    return Outcome.STUCK
 
 
-def scan_once(args: argparse.Namespace, state_dir: Path) -> None:
+@dataclass
+class ScanResult:
+    """Per-scan tally used to pick the next poll interval."""
+
+    present: int = 0
+    stuck: int = 0
+
+    @property
+    def tier(self) -> str:
+        if self.stuck:
+            return TIER_BUSY
+        if self.present:
+            return TIER_ACTIVE
+        return TIER_IDLE
+
+    def describe(self) -> str:
+        if self.stuck:
+            total = self.stuck + self.present
+            return f"{self.stuck}/{total} codex agent(s) in a capacity episode"
+        if self.present:
+            return f"{self.present} codex agent(s) healthy"
+        return "no codex agents"
+
+
+def scan_once(args: argparse.Namespace, state_dir: Path) -> ScanResult:
+    result = ScanResult()
     targets = list(args.targets) if args.targets else list_codex_targets()
-    if not targets:
-        log("no codex agents found")
-        return
     for target in targets:
         try:
-            process_target(
+            outcome = process_target(
                 target,
                 matches=args.match,
                 prompt=args.prompt,
@@ -380,6 +447,14 @@ def scan_once(args: argparse.Namespace, state_dir: Path) -> None:
             )
         except Exception as exc:  # keep watcher alive
             log(f"error processing {target}: {exc}")
+            # A target that blew up mid-scan may well be mid-episode; the
+            # fast cadence is the safe assumption.
+            outcome = Outcome.STUCK
+        if outcome is Outcome.STUCK:
+            result.stuck += 1
+        elif outcome is Outcome.PRESENT:
+            result.present += 1
+    return result
 
 
 def env_int(name: str, default: int) -> int:
@@ -439,20 +514,41 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--min-wait",
         type=int,
-        default=env_int("HERDR_CAPACITY_MIN_WAIT", 15),
-        help="Seconds to wait after first hit before continue",
+        default=env_int("HERDR_CAPACITY_MIN_WAIT", DEFAULT_MIN_WAIT),
+        help=f"Seconds to wait after first hit before continue (default: {DEFAULT_MIN_WAIT})",
     )
     p.add_argument(
         "--max-wait",
         type=int,
-        default=env_int("HERDR_CAPACITY_MAX_WAIT", 180),
-        help="Max backoff seconds between continues",
+        default=env_int("HERDR_CAPACITY_MAX_WAIT", DEFAULT_MAX_WAIT),
+        help=f"Max backoff seconds between continues (default: {DEFAULT_MAX_WAIT})",
     )
     p.add_argument(
         "--interval",
         type=int,
-        default=env_int("HERDR_CAPACITY_INTERVAL", 8),
-        help="Poll interval seconds",
+        default=env_int("HERDR_CAPACITY_INTERVAL", DEFAULT_INTERVAL),
+        help=(
+            "Poll interval seconds while codex agents are alive and healthy "
+            f"(default: {DEFAULT_INTERVAL})"
+        ),
+    )
+    p.add_argument(
+        "--busy-interval",
+        type=int,
+        default=env_int("HERDR_CAPACITY_BUSY_INTERVAL", DEFAULT_BUSY_INTERVAL),
+        help=(
+            "Poll interval seconds while a capacity episode is in progress "
+            f"(default: {DEFAULT_BUSY_INTERVAL})"
+        ),
+    )
+    p.add_argument(
+        "--idle-interval",
+        type=int,
+        default=env_int("HERDR_CAPACITY_IDLE_INTERVAL", DEFAULT_IDLE_INTERVAL),
+        help=(
+            "Poll interval seconds while no codex agent exists "
+            f"(default: {DEFAULT_IDLE_INTERVAL})"
+        ),
     )
     args = p.parse_args(argv)
     if args.match is None:
@@ -483,25 +579,44 @@ def main(argv: list[str] | None = None) -> int:
     )
     state_dir.mkdir(parents=True, exist_ok=True)
 
+    intervals = {
+        TIER_BUSY: max(1, args.busy_interval),
+        TIER_ACTIVE: max(1, args.interval),
+        TIER_IDLE: max(1, args.idle_interval),
+    }
+
     log(
         f"watching Codex capacity errors ({len(args.match)} pattern(s): "
         + ", ".join(repr(m) for m in args.match)
         + f"; prompt={args.prompt!r} "
-        f"interval={args.interval}s min_wait={args.min_wait}s "
-        f"max_wait={args.max_wait}s dry_run={args.dry_run})"
+        f"interval busy={intervals[TIER_BUSY]}s "
+        f"active={intervals[TIER_ACTIVE]}s idle={intervals[TIER_IDLE]}s "
+        f"min_wait={args.min_wait}s max_wait={args.max_wait}s "
+        f"dry_run={args.dry_run})"
     )
 
     if args.once:
-        scan_once(args, state_dir)
+        result = scan_once(args, state_dir)
+        log(f"scan complete: {result.describe()}")
         return 0
 
+    tier = None
     try:
         while True:
             try:
-                scan_once(args, state_dir)
+                result = scan_once(args, state_dir)
             except Exception as exc:  # keep watcher alive
                 log(f"scan failed: {exc}")
-            time.sleep(max(1, args.interval))
+                # Unknown state: fall back to the middle cadence instead of
+                # napping through a capacity episode.
+                result = ScanResult(present=1)
+            delay = intervals[result.tier]
+            if result.tier != tier:
+                tier = result.tier
+                log(f"poll cadence -> {tier} ({delay}s): {result.describe()}")
+            else:
+                debug(f"{result.describe()}; next scan in {delay}s ({tier})")
+            time.sleep(delay)
     except KeyboardInterrupt:
         log("interrupted; exiting")
         return 0

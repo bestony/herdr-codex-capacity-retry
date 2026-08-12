@@ -18,7 +18,8 @@ Please try again later.
 
 The agent is then idle and waits for a human. This watcher polls your Codex panes, notices
 those banners, waits with exponential backoff, and submits a `continue` prompt so the run
-picks up on its own.
+picks up on its own. Polling is [adaptive](#adaptive-poll-cadence): fast while an agent is
+stuck, slow when no Codex agent is running at all.
 
 ## Requirements
 
@@ -84,8 +85,11 @@ herdr-codex-capacity-retry --prompt "keep going"
 # Watch a different set of error banners (replaces the built-ins)
 herdr-codex-capacity-retry --match "rate limit" --match "at capacity"
 
-# Tune the timing
-herdr-codex-capacity-retry --min-wait 20 --max-wait 180 --interval 8
+# Tune the backoff between retries
+herdr-codex-capacity-retry --min-wait 20 --max-wait 90
+
+# Tune the adaptive poll cadence (stuck / healthy / no codex agent at all)
+herdr-codex-capacity-retry --busy-interval 5 --interval 10 --idle-interval 60
 
 # Log skip/wait decisions too, to see why nothing is happening
 herdr-codex-capacity-retry --verbose
@@ -107,8 +111,13 @@ herdr-codex-capacity-retry --verbose
 | `--prompt TEXT` | `continue` | Text submitted to the agent when a retry fires. |
 | `--match TEXT` | see below | Substring that marks a capacity failure. Repeatable. **Any value given replaces the built-in patterns** rather than adding to them. |
 | `--min-wait N` | `15` | Seconds to wait after the first sighting before the first `continue`, and the base of the exponential backoff. |
-| `--max-wait N` | `180` | Upper bound for the backoff between retries. |
-| `--interval N` | `8` | Poll interval in seconds (minimum 1). Ignored with `--once`. |
+| `--max-wait N` | `60` | Upper bound for the backoff between retries. |
+| `--interval N` | `10` | **active** poll interval: codex agents are alive and none is stuck. |
+| `--busy-interval N` | `5` | **busy** poll interval: at least one target is inside a capacity episode. |
+| `--idle-interval N` | `60` | **idle** poll interval: no codex agent exists at all. |
+
+All three intervals are in seconds, have a floor of 1, and are ignored with `--once`. See
+[Adaptive poll cadence](#adaptive-poll-cadence).
 
 Built-in `--match` patterns:
 
@@ -129,8 +138,10 @@ Every setting has an env fallback. Precedence is **CLI flag > env var > built-in
 | `HERDR_CAPACITY_PROMPT` | `--prompt` | `continue` |
 | `HERDR_CAPACITY_MATCH` | `--match` | built-ins — one pattern per line; blank lines ignored |
 | `HERDR_CAPACITY_MIN_WAIT` | `--min-wait` | `15` |
-| `HERDR_CAPACITY_MAX_WAIT` | `--max-wait` | `180` |
-| `HERDR_CAPACITY_INTERVAL` | `--interval` | `8` |
+| `HERDR_CAPACITY_MAX_WAIT` | `--max-wait` | `60` |
+| `HERDR_CAPACITY_INTERVAL` | `--interval` | `10` |
+| `HERDR_CAPACITY_BUSY_INTERVAL` | `--busy-interval` | `5` |
+| `HERDR_CAPACITY_IDLE_INTERVAL` | `--idle-interval` | `60` |
 | `HERDR_CAPACITY_VERBOSE` | `--verbose` | unset — any value other than empty or `0` enables it |
 | `HERDR_CAPACITY_STATE_DIR` | — | `~/.local/state/herdr-codex-capacity-retry` |
 
@@ -165,7 +176,37 @@ Each scan, per target:
    is submitted and the next wait doubles.
 
 Backoff is `min(min_wait * 2^attempts, max_wait)`, with `attempts` capped at 6. With the
-defaults that gives 15s → 30s → 60s → 120s → 180s → 180s → …
+defaults that gives 15s → 30s → 60s → 60s → …
+
+### Adaptive poll cadence
+
+Polling every few seconds is wasted work when no Codex agent is even running, and too slow
+when one is sitting on a capacity banner. So each scan tallies what it saw and the next sleep
+is chosen from that tally:
+
+| Tier | Condition | Default |
+| --- | --- | --- |
+| `busy` | At least one target is inside a capacity episode — banner up, waiting out the backoff, or inside the 3-scan clear debounce. | `--busy-interval`, 5s |
+| `active` | Codex agents exist and none is stuck (includes agents that are currently working). | `--interval`, 10s |
+| `idle` | No Codex agent at all — the scan can only ever cost one `herdr agent list` that says "nothing to do". | `--idle-interval`, 60s |
+
+Tier changes are logged, so the cadence in effect is always visible:
+
+```
+[10:01:22] poll cadence -> idle (60s): no codex agents
+[10:03:04] poll cadence -> active (10s): 2 codex agent(s) healthy
+[10:07:41] capacity hit on w36:p1 (pane=%1 status=idle match='Selected model is at capacity'); wait 15s then continue
+[10:07:41] poll cadence -> busy (5s): 1/2 codex agent(s) in a capacity episode
+```
+
+A target that cannot be read, or that raised an unexpected error mid-scan, counts toward
+`busy` when it has an open episode: a missing observation is never taken as evidence that
+things are fine. If a whole scan fails, the loop falls back to the `active` interval rather
+than napping through a capacity episode.
+
+Note that the cadence only controls how quickly the watcher *notices* things. How long a
+stuck agent actually waits between retries is set by `--min-wait` / `--max-wait`, not by the
+poll interval.
 
 Retry scheduling is purely time-based per episode. Pane snapshots are deliberately never
 hashed to decide freshness: spinners, redraws, and status-line updates change the tail even
@@ -258,10 +299,11 @@ find `herdr`.
 | Symptom | What to check |
 | --- | --- |
 | `missing dependency: herdr` | `herdr` is not on `PATH` for this process — common under launchd/cron. |
-| `no codex agents found` | `herdr agent list` shows no agent with `"agent": "codex"`, or your explicit targets are wrong. |
+| `poll cadence -> idle: no codex agents` | `herdr agent list` shows no agent with `"agent": "codex"`, or your explicit targets are wrong. The watcher stays alive and keeps checking every `--idle-interval` seconds. |
 | Banner is visible but nothing fires | Run with `--verbose`. `status=…, not settled` means Codex still looks busy; `pane unreadable` means `herdr agent read` failed. |
 | It never matches your custom banner | Compare against the real pane tail: `herdr agent read <target> --source detection --lines 60`. Remember whitespace is collapsed, so pick a short single-line substring. |
-| Retries fire too fast / too slow | Tune `--min-wait` and `--max-wait`; `--interval` only controls polling granularity. |
+| Retries fire too fast / too slow | Tune `--min-wait` and `--max-wait`. The interval flags only control polling granularity, not the gap between retries. |
+| A new banner takes too long to be noticed | Lower `--idle-interval` (nothing running) or `--interval` (agents running). The tier in effect is in the last `poll cadence ->` line. |
 | Want to confirm behaviour safely | `herdr-codex-capacity-retry --dry-run --verbose`. |
 
 ## License
